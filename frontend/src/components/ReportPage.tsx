@@ -1,72 +1,56 @@
-import React, { useState } from 'react';
-import { useKeycloak } from '@react-keycloak/web';
+import React from 'react';
+import { useAuth0 } from '@auth0/auth0-react';
+import axios from 'axios';
 
 const ReportPage: React.FC = () => {
-  const { keycloak, initialized } = useKeycloak();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { getAccessTokenSilently, user } = useAuth0();
+  const [reports, setReports] = React.useState([]);
 
-  const downloadReport = async () => {
-    if (!keycloak?.token) {
-      setError('Not authenticated');
-      return;
-    }
-
+  const fetchReports = async () => {
     try {
-      setLoading(true);
-      setError(null);
-
-      const response = await fetch(`${process.env.REACT_APP_API_URL}/reports`, {
-        headers: {
-          'Authorization': `Bearer ${keycloak.token}`
+      // PKCE обеспечивает безопасное получение токена
+      const token = await getAccessTokenSilently({
+        authorizationParams: {
+          audience: 'reports-api',
+          scope: 'read:reports'
         }
       });
 
-      
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setLoading(false);
+      const response = await axios.get(
+        `${process.env.REACT_APP_API_URL}/reports`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        }
+      );
+
+      setReports(response.data);
+    } catch (error) {
+      console.error('Error fetching reports:', error);
     }
   };
 
-  if (!initialized) {
-    return <div>Loading...</div>;
-  }
-
-  if (!keycloak.authenticated) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-        <button
-          onClick={() => keycloak.login()}
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-        >
-          Login
-        </button>
-      </div>
-    );
-  }
+  React.useEffect(() => {
+    fetchReports();
+  }, []);
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="p-8 bg-white rounded-lg shadow-md">
-        <h1 className="text-2xl font-bold mb-6">Usage Reports</h1>
-        
-        <button
-          onClick={downloadReport}
-          disabled={loading}
-          className={`px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 ${
-            loading ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-        >
-          {loading ? 'Generating Report...' : 'Download Report'}
-        </button>
-
-        {error && (
-          <div className="mt-4 p-4 bg-red-100 text-red-700 rounded">
-            {error}
+    <div className="p-4">
+      <h1 className="text-2xl font-bold mb-4">Reports</h1>
+      <div className="space-y-4">
+        {reports.map((report) => (
+          <div key={report.id} className="p-4 border rounded">
+            <h2 className="text-xl">{report.name}</h2>
+            <p>Date: {report.date}</p>
+            <button
+              onClick={() => downloadReport(report.id)}
+              className="mt-2 px-4 py-2 bg-blue-500 text-white rounded"
+            >
+              Download
+            </button>
           </div>
-        )}
+        ))}
       </div>
     </div>
   );

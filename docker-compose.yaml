@@ -11,6 +11,7 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+  
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,6 +21,9 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
+      KC_HOSTNAME: localhost  # Важно для правильных redirect URIs
+      KC_HOSTNAME_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
     command: 
       - start-dev
       - --import-realm
@@ -29,6 +33,7 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+  
   frontend:
     build:
       context: ./frontend
@@ -37,6 +42,6 @@ services:
       - "3000:3000"
     environment:
       REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_KEYCLOAK_DOMAIN: localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
