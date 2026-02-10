@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     """Настройки приложения"""
     
     # Основные настройки
-    APP_NAME: str = "BionicPRO Reports API"
-    VERSION: str = "1.0.0"
+    APP_NAME: str = "BionicPRO Reports API v2.0"
+    VERSION: str = "2.0.0"
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
     
     # Сервер
@@ -28,11 +28,15 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS", "*").split(",")
     
     # Безопасность
-    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "bionicpro_secret_key_change_in_production")
-    JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+    ENABLE_STRICT_ISOLATION: bool = os.getenv("ENABLE_STRICT_ISOLATION", "True").lower() == "true"
+    LOG_ACCESS_VIOLATIONS: bool = os.getenv("LOG_ACCESS_VIOLATIONS", "True").lower() == "true"
+    AUDIT_LOG_DIR: str = os.getenv("AUDIT_LOG_DIR", "/var/log/bionicpro/audit")
     
     # Пути для отчетов
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "/tmp/bionicpro_reports")
+    
+    # Настройки токенов
+    TOKEN_PREFIX: str = os.getenv("TOKEN_PREFIX", "user_")
     
     class Config:
         env_file = ".env"

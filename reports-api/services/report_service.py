@@ -2,11 +2,12 @@ import logging
 import uuid
 import json
 from datetime import datetime, date, timedelta
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
 import pandas as pd
 from clickhouse_driver import Client
+from fastapi import HTTPException
 
 from models.reports import (
     ReportRequest, ReportResponse, ReportFormat, TimePeriod,
@@ -17,14 +18,43 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 class ReportService:
-    """Сервис для работы с отчетами"""
+    """Сервис для работы с отчетами с изоляцией данных"""
     
     def __init__(self, clickhouse_client: Client):
         self.client = clickhouse_client
         self.reports_dir = Path(settings.REPORTS_DIR)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
     
-    def _get_period_dates(self, period: TimePeriod) -> tuple[date, date]:
+    def _validate_user_access(self, requested_user_id: int, auth_user_id: int) -> None:
+        """Валидация доступа пользователя к данным"""
+        if requested_user_id != auth_user_id:
+            logger.warning(
+                f"Попытка доступа к чужим данным: "
+                f"пользователь {auth_user_id} пытается получить данные пользователя {requested_user_id}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Доступ запрещен. Вы можете запрашивать только свои данные."
+            )
+    
+    def _check_user_exists(self, user_id: int) -> bool:
+        """Проверка существования пользователя в системе"""
+        try:
+            # Проверяем в телеметрии
+            query = """
+            SELECT COUNT(DISTINCT patient_id) 
+            FROM bionicpro_analytics.prosthesis_telemetry 
+            WHERE patient_id = %(user_id)s
+            """
+            
+            result = self.client.execute(query, {'user_id': user_id})
+            return result[0][0] > 0 if result else False
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки существования пользователя: {e}")
+            return False
+    
+    def _get_period_dates(self, period: TimePeriod) -> Tuple[date, date]:
         """Получение дат начала и конца периода"""
         today = date.today()
         
@@ -45,14 +75,30 @@ class ReportService:
             start_date = date(today.year, 1, 1)
             end_date = today
         else:  # ALL
-            start_date = date(2024, 1, 1)  # Начало данных
+            start_date = date(2024, 1, 1)
             end_date = today
         
         return start_date, end_date
     
-    def _get_prosthesis_metrics(self, user_id: int, start_date: date, end_date: date) -> Optional[ProsthesisMetrics]:
-        """Получение метрик использования протеза из витрины"""
+    def _get_prosthesis_metrics_with_validation(
+        self, 
+        requested_user_id: int,
+        auth_user_id: int,
+        start_date: date, 
+        end_date: date
+    ) -> Optional[ProsthesisMetrics]:
+        """Получение метрик протеза с проверкой доступа"""
+        
+        # Проверяем доступ
+        self._validate_user_access(requested_user_id, auth_user_id)
+        
+        # Проверяем существование пользователя
+        if not self._check_user_exists(requested_user_id):
+            logger.warning(f"Пользователь {requested_user_id} не найден в системе")
+            return None
+        
         try:
+            # Запрос с дополнительной проверкой в WHERE
             query = """
             SELECT 
                 device_id,
@@ -74,7 +120,7 @@ class ReportService:
             """
             
             params = {
-                'user_id': user_id,
+                'user_id': requested_user_id,
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat()
             }
@@ -82,7 +128,7 @@ class ReportService:
             result = self.client.execute(query, params)
             
             if not result:
-                logger.warning(f"Нет данных по протезу для пользователя {user_id}")
+                logger.info(f"Нет данных по протезу для пользователя {requested_user_id}")
                 return None
             
             row = result[0]
@@ -99,43 +145,24 @@ class ReportService:
             logger.error(f"Ошибка получения метрик протеза: {e}")
             return None
     
-    def _get_sales_metrics(self, user_id: int, start_date: date, end_date: date) -> Optional[SalesMetrics]:
-        """Получение метрик продаж (если пользователь - сотрудник отдела продаж)"""
-        try:
-            # Для учебных целей возвращаем общие метрики
-            query = """
-            SELECT 
-                sum(orders_count) as total_orders,
-                sum(total_revenue) as total_revenue,
-                avg(avg_order_amount) as avg_order_amount,
-                argMax(prosthesis_model, orders_count) as favorite_model,
-                avg(completion_rate) as completion_rate
-            FROM bionicpro_analytics.sales_mart
-            WHERE report_date BETWEEN %(start_date)s AND %(end_date)s
-            """
-            
-            params = {
-                'start_date': start_date.isoformat(),
-                'end_date': end_date.isoformat()
-            }
-            
-            result = self.client.execute(query, params)
-            
-            if not result or not result[0][0]:  # Нет заказов
-                return None
-            
-            row = result[0]
-            return SalesMetrics(
-                total_orders=int(row[0]) if row[0] else 0,
-                total_revenue=float(row[1]) if row[1] else 0.0,
-                avg_order_amount=float(row[2]) if row[2] else 0.0,
-                favorite_model=str(row[3]) if row[3] else "Нет данных",
-                completion_rate=float(row[4]) if row[4] else 0.0
-            )
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения метрик продаж: {e}")
-            return None
+    def _get_sales_metrics_with_validation(
+        self,
+        requested_user_id: int,
+        auth_user_id: int,
+        start_date: date,
+        end_date: date
+    ) -> Optional[SalesMetrics]:
+        """Получение метрик продаж с проверкой роли"""
+        
+        # Проверяем доступ
+        self._validate_user_access(requested_user_id, auth_user_id)
+        
+        # В реальном проекте здесь должна быть проверка роли пользователя
+        # Для учебных целей возвращаем None, так как обычные пользователи
+        # не должны видеть данные продаж
+        
+        logger.info(f"Пользователь {requested_user_id} запросил данные продаж - доступ запрещен")
+        return None
     
     def _generate_recommendations(self, metrics: ProsthesisMetrics) -> List[str]:
         """Генерация рекомендаций на основе метрик"""
@@ -161,10 +188,20 @@ class ReportService:
         
         return recommendations
     
-    def _get_raw_data(self, user_id: int, start_date: date, end_date: date) -> Dict[str, Any]:
-        """Получение сырых данных для отчета"""
+    def _get_raw_data_with_validation(
+        self, 
+        requested_user_id: int,
+        auth_user_id: int,
+        start_date: date, 
+        end_date: date
+    ) -> Dict[str, Any]:
+        """Получение сырых данных с проверкой доступа"""
+        
+        # Проверяем доступ
+        self._validate_user_access(requested_user_id, auth_user_id)
+        
         try:
-            # Данные телеметрии по дням
+            # Запрос с явным указанием patient_id для изоляции
             telemetry_query = """
             SELECT 
                 toDate(measurement_time) as day,
@@ -179,7 +216,7 @@ class ReportService:
             """
             
             params = {
-                'user_id': user_id,
+                'user_id': requested_user_id,
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat()
             }
@@ -202,20 +239,33 @@ class ReportService:
                     'start': start_date.isoformat(),
                     'end': end_date.isoformat()
                 },
-                'user_id': user_id
+                'user_id': requested_user_id,
+                'accessed_by': auth_user_id,
+                'access_timestamp': datetime.now().isoformat()
             }
             
         except Exception as e:
             logger.error(f"Ошибка получения сырых данных: {e}")
             return {}
     
-    def generate_report(self, request: ReportRequest, auth_data: Dict[str, Any]) -> ReportResponse:
-        """Генерация отчета по запросу"""
+    def generate_report(
+        self, 
+        request: ReportRequest, 
+        auth_data: Dict[str, Any]
+    ) -> ReportResponse:
+        """Генерация отчета с проверкой доступа"""
         
-        # Проверка доступа (в учебных целях проверяем, что user_id совпадает)
-        if auth_data.get('user_id') != request.user_id:
-            # В реальном проекте здесь должна быть проверка ролей и прав
-            logger.warning(f"Попытка доступа к чужим данным: {auth_data.get('user_id')} -> {request.user_id}")
+        # Проверяем, что пользователь запрашивает свои данные
+        if request.user_id != auth_data.get('user_id'):
+            logger.warning(
+                f"Попытка доступа к чужим данным через POST: "
+                f"пользователь {auth_data.get('user_id')} "
+                f"пытается получить отчет для {request.user_id}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Доступ запрещен. Вы можете генерировать отчеты только для себя."
+            )
         
         # Получаем период
         start_date, end_date = self._get_period_dates(request.period)
@@ -223,15 +273,25 @@ class ReportService:
         # Генерируем ID отчета
         report_id = f"rep_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         
-        # Получаем данные
+        # Получаем данные с проверкой доступа
         prosthesis_metrics = None
         sales_metrics = None
         
         if request.include_prosthesis_data:
-            prosthesis_metrics = self._get_prosthesis_metrics(request.user_id, start_date, end_date)
+            prosthesis_metrics = self._get_prosthesis_metrics_with_validation(
+                requested_user_id=request.user_id,
+                auth_user_id=auth_data.get('user_id'),
+                start_date=start_date,
+                end_date=end_date
+            )
         
         if request.include_sales_data:
-            sales_metrics = self._get_sales_metrics(request.user_id, start_date, end_date)
+            sales_metrics = self._get_sales_metrics_with_validation(
+                requested_user_id=request.user_id,
+                auth_user_id=auth_data.get('user_id'),
+                start_date=start_date,
+                end_date=end_date
+            )
         
         # Генерируем рекомендации
         recommendations = []
@@ -241,7 +301,12 @@ class ReportService:
         # Собираем сырые данные
         raw_data = None
         if request.report_format == ReportFormat.JSON:
-            raw_data = self._get_raw_data(request.user_id, start_date, end_date)
+            raw_data = self._get_raw_data_with_validation(
+                requested_user_id=request.user_id,
+                auth_user_id=auth_data.get('user_id'),
+                start_date=start_date,
+                end_date=end_date
+            )
         
         # Создаем ответ
         response = ReportResponse(
@@ -259,34 +324,41 @@ class ReportService:
         
         # Сохраняем отчет в файл если нужно
         if request.report_format != ReportFormat.JSON:
-            self._save_report_to_file(response, request.report_format)
+            self._save_report_to_file(response, request.report_format, auth_data.get('user_id'))
         
-        logger.info(f"Сгенерирован отчет {report_id} для пользователя {request.user_id}")
+        # Логируем успешный доступ
+        logger.info(
+            f"Сгенерирован отчет {report_id} для пользователя {request.user_id} "
+            f"(запросил: {auth_data.get('user_id')})"
+        )
+        
         return response
     
-    def _save_report_to_file(self, report: ReportResponse, format: ReportFormat):
-        """Сохранение отчета в файл"""
+    def _save_report_to_file(self, report: ReportResponse, format: ReportFormat, accessed_by: int):
+        """Сохранение отчета в файл с метаданными доступа"""
         try:
             file_path = self.reports_dir / f"{report.report_id}.{format}"
             
             if format == ReportFormat.CSV:
-                self._save_as_csv(report, file_path)
+                self._save_as_csv(report, file_path, accessed_by)
             elif format == ReportFormat.EXCEL:
-                self._save_as_excel(report, file_path)
+                self._save_as_excel(report, file_path, accessed_by)
             elif format == ReportFormat.PDF:
-                self._save_as_pdf(report, file_path)
+                self._save_as_pdf(report, file_path, accessed_by)
             
             logger.info(f"Отчет сохранен в файл: {file_path}")
             
         except Exception as e:
             logger.error(f"Ошибка сохранения отчета в файл: {e}")
     
-    def _save_as_csv(self, report: ReportResponse, file_path: Path):
-        """Сохранение как CSV"""
+    def _save_as_csv(self, report: ReportResponse, file_path: Path, accessed_by: int):
+        """Сохранение как CSV с метаданными доступа"""
         data = {
             'Пользователь': [report.user_id],
+            'Запросил': [accessed_by],
             'Период': [f"{report.period_start} - {report.period_end}"],
-            'Время генерации': [report.generated_at.isoformat()]
+            'Время генерации': [report.generated_at.isoformat()],
+            'Доступ': ['Собственные данные' if report.user_id == accessed_by else 'Чужие данные']
         }
         
         if report.prosthesis_metrics:
@@ -297,20 +369,21 @@ class ReportService:
         df = pd.DataFrame(data)
         df.to_csv(file_path, index=False, encoding='utf-8')
     
-    def _save_as_excel(self, report: ReportResponse, file_path: Path):
-        """Сохранение как Excel"""
+    def _save_as_excel(self, report: ReportResponse, file_path: Path, accessed_by: int):
+        """Сохранение как Excel с метаданными доступа"""
         with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-            # Основная информация
-            main_data = {
-                'Параметр': ['ID пользователя', 'ID отчета', 'Период', 'Сгенерирован'],
+            # Информация о доступе
+            access_data = {
+                'Параметр': ['ID пользователя', 'ID отчета', 'Кто запросил', 'Период', 'Доступ'],
                 'Значение': [
                     report.user_id,
                     report.report_id,
+                    accessed_by,
                     f"{report.period_start} - {report.period_end}",
-                    report.generated_at.strftime('%Y-%m-%d %H:%M:%S')
+                    '✅ Собственные данные' if report.user_id == accessed_by else '❌ Чужие данные'
                 ]
             }
-            pd.DataFrame(main_data).to_excel(writer, sheet_name='Общее', index=False)
+            pd.DataFrame(access_data).to_excel(writer, sheet_name='Информация о доступе', index=False)
             
             # Метрики протеза
             if report.prosthesis_metrics:
@@ -326,20 +399,28 @@ class ReportService:
                     'Рекомендации': report.recommendations
                 }).to_excel(writer, sheet_name='Рекомендации', index=False)
     
-    def _save_as_pdf(self, report: ReportResponse, file_path: Path):
+    def _save_as_pdf(self, report: ReportResponse, file_path: Path, accessed_by: int):
         """Сохранение как PDF (упрощенная версия)"""
-        # В реальном проекте нужно использовать reportlab или другой PDF генератор
-        # Здесь просто сохраняем как текстовый файл для учебных целей
+        access_status = "✅ Собственные данные" if report.user_id == accessed_by else "❌ ЧУЖИЕ ДАННЫЕ (НЕСАНКЦИОНИРОВАННЫЙ ДОСТУП)"
+        
         content = f"""
         ОТЧЕТ BIONICPRO
         ================
         
+        ИНФОРМАЦИЯ О ДОСТУПЕ:
+        --------------------
+        ID пользователя: {report.user_id}
+        Запросил: {accessed_by}
+        Статус доступа: {access_status}
+        
+        ОБЩАЯ ИНФОРМАЦИЯ:
+        ----------------
         ID отчета: {report.report_id}
-        Пользователь: {report.user_id}
         Период: {report.period_start} - {report.period_end}
         Сгенерирован: {report.generated_at.strftime('%Y-%m-%d %H:%M:%S')}
         
         МЕТРИКИ ПРОТЕЗА:
+        ---------------
         """
         
         if report.prosthesis_metrics:
@@ -351,4 +432,52 @@ class ReportService:
         for rec in report.recommendations:
             content += f"\n• {rec}"
         
+        content += f"\n\n---\nЭтот отчет предназначен только для пользователя {report.user_id}"
+        content += f"\nЗапрошено пользователем {accessed_by} в {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
         file_path.write_text(content, encoding='utf-8')
+    
+    def get_user_device_info(self, user_id: int, auth_user_id: int) -> Dict[str, Any]:
+        """Получение информации об устройствах пользователя с проверкой доступа"""
+        self._validate_user_access(user_id, auth_user_id)
+        
+        try:
+            query = """
+            SELECT 
+                device_id,
+                max(firmware_version) as firmware,
+                count() as total_records,
+                min(measurement_time) as first_activity,
+                max(measurement_time) as last_activity
+            FROM bionicpro_analytics.prosthesis_telemetry
+            WHERE patient_id = %(user_id)s
+            GROUP BY device_id
+            ORDER BY last_activity DESC
+            """
+            
+            result = self.client.execute(query, {'user_id': user_id})
+            
+            devices = []
+            for row in result:
+                devices.append({
+                    'device_id': row[0],
+                    'firmware_version': row[1],
+                    'total_records': row[2],
+                    'first_activity': row[3].isoformat() if row[3] else None,
+                    'last_activity': row[4].isoformat() if row[4] else None
+                })
+            
+            return {
+                'user_id': user_id,
+                'device_count': len(devices),
+                'devices': devices,
+                'accessed_by': auth_user_id,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения информации об устройствах: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Ошибка получения информации об устройствах"
+            )
