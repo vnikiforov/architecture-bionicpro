@@ -1,27 +1,25 @@
 import { Auth0ProviderOptions } from '@auth0/auth0-spa-js';
 
 export const authConfig: Auth0ProviderOptions = {
-  domain: 'localhost:8080', // Или ваш Keycloak domain
-  clientId: 'reports-frontend',
+  domain: process.env.REACT_APP_AUTH_DOMAIN || 'localhost:8080',
+  clientId: process.env.REACT_APP_CLIENT_ID || 'reports-frontend',
   authorizationParams: {
     redirect_uri: window.location.origin,
     audience: 'reports-api',
-    scope: 'openid profile email roles'
+    scope: 'openid profile email roles read:reports write:reports'
   },
   useRefreshTokens: true,
-  cacheLocation: 'localstorage' 
-  // PKCE включен по умолчанию в @auth0/auth0-spa-js
+  cacheLocation: 'localstorage'
 };
 
-// Альтернативно, с использованием oidc-client-ts:
 export const oidcConfig = {
-  authority: 'http://localhost:8080/realms/reports-realm',
-  client_id: 'reports-frontend',
-  redirect_uri: 'http://localhost:3000/callback',
-  response_type: 'code',               // Authorization Code Flow
-  scope: 'openid profile email roles',
-  post_logout_redirect_uri: 'http://localhost:3000/',
+  authority: `http://${process.env.REACT_APP_AUTH_DOMAIN || 'localhost:8080'}/realms/reports-realm`,
+  client_id: process.env.REACT_APP_CLIENT_ID || 'reports-frontend',
+  redirect_uri: `${window.location.origin}/callback`,
+  response_type: 'code',
+  scope: 'openid profile email roles read:reports write:reports',
+  post_logout_redirect_uri: window.location.origin,
   automaticSilentRenew: true,
   loadUserInfo: true,
-  pkceMethod: 'S256'                   // Включение PKCE
+  pkceMethod: 'S256'
 };
