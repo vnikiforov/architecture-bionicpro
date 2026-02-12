@@ -1,0 +1,8 @@
+apache-airflow-providers-clickhouse==3.3.0
+apache-airflow-providers-http==4.4.0
+apache-airflow-providers-postgres==5.6.0
+pandas==2.1.4
+clickhouse-driver==0.2.6
+clickhouse-connect==0.6.16
+requests==2.31.0
+pyarrow==14.0.1
