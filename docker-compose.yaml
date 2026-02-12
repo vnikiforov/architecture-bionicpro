@@ -1,4 +1,28 @@
+# docker-compose.yml
+version: '3.8'
+
 services:
+  # === Общая аналитическая БД (единый экземпляр) ===
+  clickhouse:
+    image: yandex/clickhouse-server:22.3
+    container_name: bionicpro_clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=bionicpro_analytics
+      - CLICKHOUSE_USER=report_user
+      - CLICKHOUSE_PASSWORD=report_bionicpro_2024
+    volumes:
+      - ./airflow/scripts/init-clickhouse.sql:/docker-entrypoint-initdb.d/init.sql
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # === Keycloak (аутентификация) ===
   keycloak_db:
     image: postgres:14
     environment:
@@ -6,10 +30,10 @@ services:
       POSTGRES_USER: keycloak_user
       POSTGRES_PASSWORD: keycloak_password
     volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
-  
+      - postgres-keycloak-data:/var/lib/postgresql/data
+    networks:
+      - bionicpro-net
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -19,7 +43,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-      KC_HOSTNAME: localhost  # Важно для правильных redirect URIs
+      KC_HOSTNAME: host.docker.internal
       KC_HOSTNAME_PORT: 8080
       KC_HOSTNAME_STRICT: "false"
     command: 
@@ -30,16 +54,151 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - keycloak_db
-  
+      keycloak_db:
+        condition: service_started
+    networks:
+      - bionicpro-net
+
+  # === Airflow (ETL-процессы) ===
+  postgres_airflow:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow123
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bionicpro-net
+
+  airflow-scheduler:
+    build: ./airflow
+    container_name: airflow_scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      postgres_airflow:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@postgres_airflow/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__WEBSERVER__SECRET_KEY=airflow_secret_key
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/config:/opt/airflow/config
+      - ./airflow/scripts:/opt/airflow/scripts
+    user: "50000:50000"
+    networks:
+      - bionicpro-net
+
+  airflow-webserver:
+    build: ./airflow
+    container_name: airflow_webserver
+    command: webserver
+    restart: always
+    depends_on:
+      - airflow-scheduler
+    ports:
+      - "8081:8080"  # Смещённый порт для избежания конфликта с Keycloak
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@postgres_airflow/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=airflow_secret_key
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/config:/opt/airflow/config
+    user: "50000:50000"
+    networks:
+      - bionicpro-net
+
+  mock-crm-api:
+    image: mockserver/mockserver:5.15.0
+    container_name: mock_crm_api
+    ports:
+      - "8082:1080"
+    command: -serverPort 1080 -logLevel INFO
+    volumes:
+      - ./airflow/mock-crm/expectations.json:/config/expectations.json
+    networks:
+      - bionicpro-net
+
+  # === Reports API ===
+  reports-api:
+    build: ./reports-api
+    container_name: bionicpro_reports_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - DEBUG=True
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_USER=report_user
+      - CLICKHOUSE_PASSWORD=report_bionicpro_2024
+      - CLICKHOUSE_DATABASE=bionicpro_analytics
+      - REPORTS_DIR=/app/reports
+      - CORS_ORIGINS=http://localhost:3000
+    volumes:
+      - reports_data:/app/reports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - bionicpro-net
+
+  # === Frontend ===
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3000:80"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_DOMAIN: localhost:8080
+      REACT_APP_API_URL: http://host.docker.internal:8000
+      REACT_APP_KEYCLOAK_DOMAIN: host.docker.internal:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    networks:
+      - bionicpro-net
+
+  # === Reverse Proxy (единая точка входа) ===
+  nginx-proxy:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - reports-api
+      - airflow-webserver
+      - keycloak
+    networks:
+      - bionicpro-net
+
+volumes:
+  clickhouse_data:
+  postgres_airflow_data:
+  postgres-keycloak-data:
+  reports_data:
+
+networks:
+  bionicpro-net:
+    driver: bridge
+    name: bionicpro-net
